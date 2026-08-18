@@ -1,4 +1,3 @@
-# server.py (FastAPI)
 import os
 import sqlite3
 import json
@@ -8,9 +7,8 @@ import time
 import random
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -380,29 +378,23 @@ class UpgradeRequest(BaseModel):
 
 # ==================== ЗАЩИТА ====================
 def verify_telegram_auth(init_data: str) -> Optional[int]:
-    """Проверяет подпись Telegram WebApp и возвращает user_id"""
     try:
         params = dict(x.split('=') for x in init_data.split('&'))
         hash_value = params.pop('hash', None)
         if not hash_value:
             return None
         
-        # Сортируем ключи
         data_check_string = '\n'.join(f'{k}={v}' for k, v in sorted(params.items()))
-        
-        # Вычисляем подпись
         secret_key = hashlib.sha256(BOT_TOKEN.encode()).digest()
         computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         
         if computed_hash != hash_value:
             return None
         
-        # Проверяем время (актуально 24 часа)
         auth_date = int(params.get('auth_date', 0))
         if time.time() - auth_date > 86400:
             return None
         
-        # Извлекаем user_id
         user_data = json.loads(params.get('user', '{}'))
         return user_data.get('id')
     except:
@@ -528,27 +520,22 @@ def open_case(user_id: int, case_name: str) -> Optional[Dict]:
     conn = get_db()
     cur = conn.cursor()
     
-    # Проверяем баланс
     balance = get_balance(user_id)
     price = get_case_price(case_name)
     if not price or balance < price:
         conn.close()
         return None
     
-    # Списываем деньги
     update_balance(user_id, -price)
     
-    # Получаем скины из кейса
     skins = get_case_skins(case_name)
     if not skins:
         conn.close()
         return None
     
-    # Выбираем скин по шансу
     weights = [s['chance'] for s in skins]
     selected = random.choices(skins, weights=weights, k=1)[0]
     
-    # Добавляем в инвентарь
     cur.execute('INSERT INTO inventory (user_id, skin_id, acquired_date) VALUES (?, ?, ?)',
                 (user_id, selected['id'], datetime.now()))
     cur.execute('UPDATE users SET total_opened = total_opened + 1, xp = xp + 1 WHERE id = ?', (user_id,))
@@ -561,7 +548,6 @@ def do_upgrade(user_id: int, inventory_id: int, target_skin_id: int) -> Dict:
     conn = get_db()
     cur = conn.cursor()
     
-    # Проверяем, что скин в инвентаре у пользователя
     cur.execute('SELECT id, skin_id FROM inventory WHERE id = ? AND user_id = ?', (inventory_id, user_id))
     inv = cur.fetchone()
     if not inv:
@@ -570,7 +556,6 @@ def do_upgrade(user_id: int, inventory_id: int, target_skin_id: int) -> Dict:
     
     inv_id, current_skin_id = inv
     
-    # Получаем текущий скин
     current = get_skin(current_skin_id)
     target = get_skin(target_skin_id)
     
@@ -578,7 +563,6 @@ def do_upgrade(user_id: int, inventory_id: int, target_skin_id: int) -> Dict:
         conn.close()
         return {'success': False, 'error': 'Скин не найден'}
     
-    # Проверяем условия апгрейда
     in_price = current['price_rub']
     out_price = target['price_rub']
     
@@ -590,18 +574,14 @@ def do_upgrade(user_id: int, inventory_id: int, target_skin_id: int) -> Dict:
         conn.close()
         return {'success': False, 'error': 'Недопустимая цена выхода'}
     
-    # Вычисляем шанс
     raw_chance = (in_price / out_price) * 0.9 * 100
     chance = max(0.1, min(95, raw_chance))
     
-    # Удаляем входной скин
     cur.execute('DELETE FROM inventory WHERE id = ?', (inv_id,))
     
-    # Роллим
     success = random.random() * 100 < chance
     
     if success:
-        # Добавляем целевой скин
         cur.execute('INSERT INTO inventory (user_id, skin_id, acquired_date) VALUES (?, ?, ?)',
                     (user_id, target_skin_id, datetime.now()))
         conn.commit()
@@ -629,7 +609,6 @@ async def auth(data: AuthData):
     if not user_id:
         raise HTTPException(status_code=403, detail="Invalid auth")
     
-    # Создаём пользователя если его нет
     create_user(user_id)
     
     return {"user_id": user_id}
@@ -647,18 +626,15 @@ async def inventory(user_id: int):
 
 @app.post("/api/open_case")
 async def open_case_api(req: OpenCaseRequest, request: Request):
-    # Проверяем авторизацию через заголовок
     user_id = request.headers.get('X-User-ID')
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
     
     user_id = int(user_id)
     
-    # Проверяем лимиты
     if not check_limit(user_id, 'cases', 20):
         raise HTTPException(status_code=429, detail="Too many cases (max 20 per minute)")
     
-    # Открываем кейс
     result = open_case(user_id, req.case_name)
     if not result:
         raise HTTPException(status_code=400, detail="Недостаточно монет или кейс не найден")
@@ -667,18 +643,15 @@ async def open_case_api(req: OpenCaseRequest, request: Request):
 
 @app.post("/api/upgrade")
 async def upgrade_api(req: UpgradeRequest, request: Request):
-    # Проверяем авторизацию
     user_id = request.headers.get('X-User-ID')
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
     
     user_id = int(user_id)
     
-    # Проверяем лимиты
     if not check_limit(user_id, 'upgrades', 5):
         raise HTTPException(status_code=429, detail="Too many upgrades (max 5 per minute)")
     
-    # Выполняем апгрейд
     result = do_upgrade(user_id, req.inventory_id, req.target_skin_id)
     if not result['success']:
         raise HTTPException(status_code=400, detail=result.get('error', 'Ошибка'))
@@ -687,15 +660,12 @@ async def upgrade_api(req: UpgradeRequest, request: Request):
 
 @app.get("/api/skins/{skin_id}")
 async def get_skin_image(skin_id: int):
-    """Отдаёт картинку скина из папки skins/"""
     img_path = f"{SKINS_DIR}/{skin_id}.jpg"
     if os.path.exists(img_path):
         return FileResponse(img_path)
-    # Если нет картинки — отдаём заглушку
     default_path = f"{SKINS_DIR}/default.jpg"
     if os.path.exists(default_path):
         return FileResponse(default_path)
-    # Если нет даже заглушки — возвращаем 404
     raise HTTPException(status_code=404, detail="Image not found")
 
 @app.get("/api/top_players")
@@ -733,9 +703,11 @@ async def top_clans():
     conn.close()
     return [{'name': r[0], 'tag': r[1], 'members': r[2], 'avg_balance': int(r[3])} for r in rows]
 
+# ==================== ГЛАВНАЯ СТРАНИЦА ====================
 @app.get("/")
 async def root():
-    return {"status": "ARZDROP API", "version": "1.0"}
+    """Отдаём интерфейс вместо JSON"""
+    return FileResponse("web.html")
 
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
